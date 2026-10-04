@@ -355,9 +355,9 @@ async def create_batch_certificate(req: CertificateCreateRequest) -> JSONRespons
 
 @app.post(
     "/api/v1/certificates/reverify",
-    summary="证书重核验:凭冻结快照恢复参数,以新扫描/读数复核;通过则原子递增 revision,否则吊销",
+    summary="证书重核验:凭冻结快照恢复参数,以新扫描/读数复核;通过则追加新 revision 的不可变证据快照并重算 digest,否则吊销",
     responses={
-        200: {"description": "复核通过返回递增后的 revision;任何错位/质控失败/视图摘要变化返回 REVOKED 与首个失效原因"},
+        200: {"description": "复核通过返回递增后的 revision 与覆盖新证据快照的 digest;任何错位/质控失败/视图摘要变化返回 REVOKED 与首个失效原因"},
         404: {"description": "批次无证书"},
         409: {"description": "证书已吊销(不可恢复)、expected_revision 与当前 revision 不符,或 request_key 曾被不同内容使用"},
         422: {"description": "请求非法或盲化视图结构非法,证书保持不变"},

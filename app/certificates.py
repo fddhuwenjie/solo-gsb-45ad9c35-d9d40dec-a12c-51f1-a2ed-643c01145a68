@@ -12,11 +12,14 @@ Two endpoints:
 * ``POST /api/v1/certificates/reverify`` — re-checks a certified batch with
   a fresh scan and fresh readings (and optionally the blinded operational
   view). Every other parameter is restored from the frozen snapshot. If the
-  batch still passes, the revision is incremented atomically; any
+  batch still passes, an immutable revision snapshot carrying the fresh
+  scan/readings is appended, the content digest is recomputed over that
+  snapshot and the certificate is pointed at the new revision — all in the
+  same transaction; every past revision stays stored and auditable. Any
   misplacement, QC failure or view-digest change marks the certificate
-  ``REVOKED`` and the first failure reason is returned. A revoked
-  certificate can never be restored, and a stale ``expected_revision`` can
-  never overwrite a newer one (409).
+  ``REVOKED`` (no new revision is appended) and the first failure reason is
+  returned. A revoked certificate can never be restored, and a stale
+  ``expected_revision`` can never overwrite a newer one (409).
 
 Idempotency: both endpoints take ``batch_id`` + ``request_key``. Replaying a
 request key with identical content returns the recorded response; the same
@@ -89,6 +92,19 @@ CREATE TABLE IF NOT EXISTS certificates (
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
+-- Immutable per-revision evidence snapshots. Rows are append-only: a
+-- successful re-verification adds exactly one row carrying the fresh
+-- scan/readings, so every past revision stays auditable. ``certificates``
+-- always points at the latest revision.
+CREATE TABLE IF NOT EXISTS certificate_revisions (
+    batch_id        TEXT NOT NULL,
+    revision        INTEGER NOT NULL CHECK (revision >= 1),
+    digest          TEXT NOT NULL,
+    view_digest     TEXT,
+    snapshot        TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (batch_id, revision)
+);
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     request_key     TEXT PRIMARY KEY,
     endpoint        TEXT NOT NULL,
@@ -114,11 +130,12 @@ class CertificateViewInvalid(Exception):
 
 
 class CertificateStore:
-    """SQLite persistence for certificates and idempotency keys.
+    """SQLite persistence for certificates, revision snapshots, idempotency.
 
     A single connection guarded by an RLock; every endpoint operation runs
-    inside one ``BEGIN IMMEDIATE`` transaction so the certificate write and
-    the idempotency record commit (or roll back) together.
+    inside one ``BEGIN IMMEDIATE`` transaction so the certificate write, the
+    appended revision snapshot and the idempotency record commit (or roll
+    back) together.
     """
 
     def __init__(self, path: str):
@@ -131,6 +148,16 @@ class CertificateStore:
         self._lock = threading.RLock()
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
+            # Databases written before per-revision snapshots existed: anchor
+            # every certificate's current snapshot as an auditable revision
+            # row (its current revision number). INSERT OR IGNORE keeps the
+            # migration idempotent across restarts.
+            self._conn.execute(
+                "INSERT OR IGNORE INTO certificate_revisions "
+                "(batch_id, revision, digest, view_digest, snapshot, created_at) "
+                "SELECT batch_id, revision, digest, view_digest, snapshot, "
+                "created_at FROM certificates"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -271,11 +298,45 @@ def _snapshot(req: CertificateCreateRequest, rows: int, cols: int,
     }
 
 
+def _reverification_snapshot(base: dict, req: CertificateReverifyRequest,
+                             view_digest: str | None) -> dict:
+    """Evidence frozen at the next revision of a re-verified certificate.
+
+    The plan parameters (plate, layout, samples, seed, thresholds) and the
+    frozen view digest carry over unchanged from the current snapshot; only
+    the scan and the readings come from the re-verification request.
+    """
+    return {
+        "batch_id": base["batch_id"],
+        "plate": base["plate"],
+        "target": base["target"],
+        "scan": dict(req.scan),
+        "readings": dict(req.readings),
+        "samples": base["samples"],
+        "blocked_wells": base["blocked_wells"],
+        "seed": base["seed"],
+        "thresholds": base["thresholds"],
+        "view_digest": view_digest,
+    }
+
+
 def _get_certificate(conn: sqlite3.Connection, batch_id: str) -> dict | None:
     row = conn.execute(
         "SELECT * FROM certificates WHERE batch_id = ?", (batch_id,)
     ).fetchone()
     return dict(row) if row is not None else None
+
+
+def _insert_revision(conn: sqlite3.Connection, batch_id: str, revision: int,
+                     digest: str, view_digest: str | None,
+                     snapshot_json: str, created_at: str) -> None:
+    """Append one immutable evidence snapshot for a certificate revision."""
+    conn.execute(
+        "INSERT INTO certificate_revisions "
+        "(batch_id, revision, digest, view_digest, snapshot, created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (batch_id, revision, digest, view_digest, snapshot_json, created_at),
+    )
 
 
 def _idem_record(conn: sqlite3.Connection, request_key: str, endpoint: str,
@@ -379,7 +440,9 @@ def create_certificate(req: CertificateCreateRequest) -> tuple[int, dict]:
             return 422, body
 
         # RELEASED: freeze layout, scan, readings, thresholds and the view
-        # digest in the same transaction as the idempotency record.
+        # digest in the same transaction as the idempotency record. The
+        # snapshot is stored twice: as revision 1 of the append-only
+        # evidence trail and as the certificate's current snapshot.
         snapshot = _snapshot(req, rows, cols, view_digest)
         snapshot_json = _canonical_json(snapshot)
         digest = _sha256(snapshot_json)
@@ -392,6 +455,8 @@ def create_certificate(req: CertificateCreateRequest) -> tuple[int, dict]:
             (req.batch_id, cert_id, STATUS_ACTIVE, 1, digest, view_digest,
              snapshot_json.decode("utf-8"), None, None, now, now),
         )
+        _insert_revision(conn, req.batch_id, 1, digest, view_digest,
+                         snapshot_json.decode("utf-8"), now)
         body = {
             "certificate_id": cert_id,
             "batch_id": req.batch_id,
@@ -545,12 +610,26 @@ def reverify_certificate(req: CertificateReverifyRequest) -> tuple[int, dict]:
                 cycles=[],
             )
 
-        # Still passing: atomically increment the revision.
+        # Still passing: freeze the fresh evidence (new scan/readings over
+        # the unchanged frozen plan) as the next immutable revision, recompute
+        # the digest over that snapshot and point the certificate at it —
+        # revision counter, current snapshot, appended revision row and the
+        # idempotency record all commit (or roll back) in this transaction.
         new_revision = cert["revision"] + 1
+        new_snapshot_json = _canonical_json(
+            _reverification_snapshot(snapshot, req, cert["view_digest"])
+        )
+        new_digest = _sha256(new_snapshot_json)
+        now = _utcnow()
+        _insert_revision(conn, req.batch_id, new_revision, new_digest,
+                         cert["view_digest"], new_snapshot_json.decode("utf-8"),
+                         now)
         cur = conn.execute(
-            "UPDATE certificates SET revision = ?, updated_at = ? "
+            "UPDATE certificates SET revision = ?, digest = ?, snapshot = ?, "
+            "updated_at = ? "
             "WHERE batch_id = ? AND revision = ? AND status = ?",
-            (new_revision, _utcnow(), req.batch_id, cert["revision"], STATUS_ACTIVE),
+            (new_revision, new_digest, new_snapshot_json.decode("utf-8"), now,
+             req.batch_id, cert["revision"], STATUS_ACTIVE),
         )
         if cur.rowcount != 1:
             # Unreachable: the row is locked by this transaction. Guarded so a
@@ -561,7 +640,7 @@ def reverify_certificate(req: CertificateReverifyRequest) -> tuple[int, dict]:
             "batch_id": req.batch_id,
             "status": STATUS_ACTIVE,
             "revision": new_revision,
-            "digest": cert["digest"],
+            "digest": new_digest,
             "view_digest": cert["view_digest"],
         }
         _idem_record(conn, req.request_key, _ENDPOINT_REVERIFY, content_hash, 200, body)

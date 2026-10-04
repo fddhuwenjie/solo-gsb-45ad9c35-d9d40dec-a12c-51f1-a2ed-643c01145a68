@@ -3,12 +3,16 @@
 Creation reuses the release verification: only a RELEASED verdict is
 certified, freezing layout/scan/readings/thresholds and the blinded-view
 digest into one SQLite transaction. Re-verification restores the frozen
-parameters, increments the revision atomically on success and revokes the
-certificate on any misplacement, QC failure or view-digest change (first
-failure reason returned). A revoked certificate can never be restored and
-stale revisions can never overwrite. Idempotency: the same request_key with
-identical content replays the recorded response; different content is 409.
+parameters; on success it appends an immutable per-revision evidence
+snapshot (fresh scan/readings) in the same transaction and returns the
+digest recomputed over it — older revisions stay auditable — while any
+misplacement, QC failure or view-digest change revokes the certificate
+(first failure reason returned, no new revision appended). A revoked
+certificate can never be restored and stale revisions can never overwrite.
+Idempotency: the same request_key with identical content replays the
+recorded response; different content is 409.
 """
+import concurrent.futures
 import hashlib
 import json
 import sqlite3
@@ -111,6 +115,24 @@ def _create_cert(**over):
     r = client.post("/api/v1/certificates", json=_create_payload(**over))
     assert r.status_code == 201, r.text
     return r.json()
+
+
+def _revision_rows(db_path):
+    """All stored revision snapshots plus the certificate's current row."""
+    conn = sqlite3.connect(str(db_path))
+    rows = conn.execute(
+        "SELECT revision, digest, view_digest, snapshot "
+        "FROM certificate_revisions ORDER BY revision"
+    ).fetchall()
+    current = conn.execute(
+        "SELECT revision, digest, snapshot, status FROM certificates"
+    ).fetchone()
+    conn.close()
+    return rows, current
+
+
+def _snapshot_digest(snapshot: dict) -> str:
+    return hashlib.sha256(certificates._canonical_json(snapshot)).hexdigest()
 
 
 # --------------------------------------------------------------------- create
@@ -416,6 +438,217 @@ def test_revoked_certificate_can_never_be_restored():
     assert r.status_code == 409
     assert r.json()["error"] == "CERTIFICATE_ALREADY_EXISTS"
     assert r.json()["status"] == "REVOKED"
+
+
+# ------------------------------------------------------- revision snapshots
+
+
+def test_reverify_success_appends_immutable_revision_with_new_digest(fresh_store):
+    created = _create_cert()
+    new_readings = _readings(row_bump=0.5)  # passes the frozen gates
+    r = client.post("/api/v1/certificates/reverify",
+                    json=_reverify_payload(readings=new_readings))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "ACTIVE"
+    assert body["revision"] == 2
+    # The digest now covers the revision-2 evidence, not the creation data.
+    assert body["digest"] != created["digest"]
+    assert body["view_digest"] == created["view_digest"]
+
+    rows, current = _revision_rows(fresh_store)
+    assert [row[0] for row in rows] == [1, 2]
+    rev1 = json.loads(rows[0][3])
+    rev2 = json.loads(rows[1][3])
+    # Revision 1 keeps the creation-time evidence, unchanged and auditable.
+    assert rev1["readings"] == _readings()
+    assert rev1["scan"] == {w: s for s, w in LAYOUT_4X4.items()}
+    # Revision 2 freezes the fresh scan/readings over the unchanged plan.
+    assert rev2["readings"] == new_readings
+    assert rev2["scan"] == rev1["scan"]
+    assert rev2["target"] == rev1["target"]
+    assert rev2["samples"] == rev1["samples"]
+    assert rev2["thresholds"] == rev1["thresholds"]
+    assert rev2["view_digest"] == rev1["view_digest"]
+    # Each stored digest covers its own revision snapshot.
+    assert rows[0][1] == created["digest"] == _snapshot_digest(rev1)
+    assert rows[1][1] == body["digest"] == _snapshot_digest(rev2)
+    # The certificate itself points at the latest revision and evidence.
+    assert current[0] == 2
+    assert current[1] == body["digest"]
+    assert json.loads(current[2])["readings"] == new_readings
+
+
+def test_reverify_identical_evidence_keeps_digest_but_appends_revision(fresh_store):
+    created = _create_cert()
+    r = client.post("/api/v1/certificates/reverify", json=_reverify_payload())
+    assert r.status_code == 200
+    # Same scan/readings -> same evidence content -> same digest, but the
+    # new revision is still appended to the audit trail.
+    assert r.json()["digest"] == created["digest"]
+    rows, _ = _revision_rows(fresh_store)
+    assert [row[0] for row in rows] == [1, 2]
+    assert json.loads(rows[0][3]) == json.loads(rows[1][3])
+
+
+def test_reverify_revision_evidence_survives_restart(fresh_store):
+    created = _create_cert()
+    first = client.post("/api/v1/certificates/reverify",
+                        json=_reverify_payload(readings=_readings(row_bump=0.5)))
+    assert first.status_code == 200
+    digest_v2 = first.json()["digest"]
+    assert digest_v2 != created["digest"]
+
+    # Simulate a service restart: the store is rebuilt from the same file.
+    certificates.reset_stores()
+
+    conn = sqlite3.connect(str(fresh_store))
+    row = conn.execute(
+        "SELECT revision, digest, snapshot FROM certificates").fetchone()
+    conn.close()
+    # The current snapshot is the revision-2 evidence, not creation data.
+    assert row[0] == 2
+    assert row[1] == digest_v2
+    assert json.loads(row[2])["readings"] == _readings(row_bump=0.5)
+
+    # The service keeps verifying from the restored state.
+    r = client.post("/api/v1/certificates/reverify", json=_reverify_payload(
+        request_key="reverify-2", expected_revision=2,
+        readings=_readings(row_bump=0.25)))
+    assert r.status_code == 200, r.text
+    assert r.json()["revision"] == 3
+    assert r.json()["digest"] not in (created["digest"], digest_v2)
+    rows, current = _revision_rows(fresh_store)
+    assert [row[0] for row in rows] == [1, 2, 3]
+    assert current[0] == 3 and current[1] == r.json()["digest"]
+
+
+def test_reverify_replay_does_not_append_extra_revision(fresh_store):
+    _create_cert()
+    payload = _reverify_payload(readings=_readings(row_bump=0.5))
+    b1 = client.post("/api/v1/certificates/reverify", json=payload)
+    b2 = client.post("/api/v1/certificates/reverify", json=payload)
+    assert b1.status_code == 200 and b2.status_code == 200
+    assert b1.json() == b2.json()
+    assert b2.json()["revision"] == 2
+    # The replay returned the recorded response without appending a revision.
+    rows, _ = _revision_rows(fresh_store)
+    assert [row[0] for row in rows] == [1, 2]
+
+
+def test_reverify_replay_after_restart_returns_recorded_response(fresh_store):
+    _create_cert()
+    payload = _reverify_payload(readings=_readings(row_bump=0.5))
+    first = client.post("/api/v1/certificates/reverify", json=payload)
+    assert first.status_code == 200
+
+    certificates.reset_stores()  # restart on the same database file
+
+    replay = client.post("/api/v1/certificates/reverify", json=payload)
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    rows, _ = _revision_rows(fresh_store)
+    assert [row[0] for row in rows] == [1, 2]
+
+
+def test_reverify_concurrent_same_expected_revision_exactly_one_wins(fresh_store):
+    _create_cert()
+    payload_a = _reverify_payload(request_key="race-a",
+                                  readings=_readings(row_bump=0.25))
+    payload_b = _reverify_payload(request_key="race-b",
+                                  readings=_readings(row_bump=0.5))
+
+    def _post(payload):
+        # One client per thread; the store serializes the transactions.
+        return TestClient(app).post("/api/v1/certificates/reverify", json=payload)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(_post, [payload_a, payload_b]))
+
+    ok = [r for r in responses if r.status_code == 200]
+    conflicts = [r for r in responses if r.status_code == 409]
+    assert len(ok) == 1 and len(conflicts) == 1
+    assert ok[0].json()["status"] == "ACTIVE"
+    assert ok[0].json()["revision"] == 2
+    body = conflicts[0].json()
+    assert body["error"] == "CERTIFICATE_REVISION_MISMATCH"
+    assert body["current_revision"] == 2
+    # Exactly one revision was appended despite the race.
+    rows, _ = _revision_rows(fresh_store)
+    assert [row[0] for row in rows] == [1, 2]
+
+    # The loser's state-dependent rejection did not burn its request key:
+    # the same key with the corrected revision verifies successfully.
+    loser = payload_a if responses[0].status_code == 409 else payload_b
+    loser["expected_revision"] = 2
+    r = client.post("/api/v1/certificates/reverify", json=loser)
+    assert r.status_code == 200
+    assert r.json()["revision"] == 3
+
+
+def test_reverify_stale_expected_revision_after_restart_is_409(fresh_store):
+    _create_cert()
+    r = client.post("/api/v1/certificates/reverify",
+                    json=_reverify_payload(readings=_readings(row_bump=0.5)))
+    assert r.status_code == 200
+
+    certificates.reset_stores()  # restart on the same database file
+
+    r = client.post("/api/v1/certificates/reverify", json=_reverify_payload(
+        request_key="reverify-stale", expected_revision=1,
+        readings=_readings(row_bump=0.25)))
+    assert r.status_code == 409
+    body = r.json()
+    assert body["error"] == "CERTIFICATE_REVISION_MISMATCH"
+    assert body["current_revision"] == 2
+    assert body["expected_revision"] == 1
+    # The rejected request appended nothing; the current revision verifies.
+    rows, _ = _revision_rows(fresh_store)
+    assert [row[0] for row in rows] == [1, 2]
+    r = client.post("/api/v1/certificates/reverify", json=_reverify_payload(
+        request_key="reverify-current", expected_revision=2,
+        readings=_readings(row_bump=0.25)))
+    assert r.status_code == 200
+    assert r.json()["revision"] == 3
+
+
+def test_reverify_revocation_appends_no_new_revision(fresh_store):
+    created = _create_cert()
+    r = client.post("/api/v1/certificates/reverify",
+                    json=_reverify_payload(readings=_readings(row_bump=100.0)))
+    assert r.status_code == 200
+    assert r.json()["status"] == "REVOKED"
+    assert r.json()["digest"] == created["digest"]
+    rows, current = _revision_rows(fresh_store)
+    # Only the creation revision exists; the certificate keeps the last
+    # good evidence and its digest.
+    assert [row[0] for row in rows] == [1]
+    assert current[3] == "REVOKED"
+    assert current[0] == 1
+    assert current[1] == created["digest"]
+
+
+def test_store_open_backfills_revision_rows_for_legacy_databases(fresh_store):
+    created = _create_cert()
+    # Simulate a database written before per-revision snapshots existed.
+    conn = sqlite3.connect(str(fresh_store))
+    conn.execute("DELETE FROM certificate_revisions")
+    conn.commit()
+    conn.close()
+
+    certificates.reset_stores()  # reopen -> migration anchors current state
+    certificates.get_store()  # lazily reopens the store and runs the migration
+
+    rows, _ = _revision_rows(fresh_store)
+    assert [row[0] for row in rows] == [1]
+    assert rows[0][1] == created["digest"]
+    # The next re-verification appends revision 2 on top of the anchor.
+    r = client.post("/api/v1/certificates/reverify",
+                    json=_reverify_payload(readings=_readings(row_bump=0.5)))
+    assert r.status_code == 200
+    assert r.json()["revision"] == 2
+    rows, _ = _revision_rows(fresh_store)
+    assert [row[0] for row in rows] == [1, 2]
 
 
 # ------------------------------------------------------------- confidentiality

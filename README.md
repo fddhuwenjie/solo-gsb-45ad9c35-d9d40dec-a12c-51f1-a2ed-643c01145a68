@@ -632,7 +632,10 @@ curl -X POST http://localhost:8000/api/v1/certificates \
 
 凭 `batch_id`、`expected_revision` 与**新的** `scan`/`readings`（可带视图）复核已获证
 批次：板型、计划 layout、样本分组、seed 与全部阈值从**冻结快照**恢复，重新执行与
-建立时完全相同的两级放行核验（纠位规则 + 空间质控门控）。
+建立时完全相同的两级放行核验（纠位规则 + 空间质控门控）。复核通过时在**同一
+SQLite 事务**中追加一条包含本次 scan/readings 的**不可变 revision 快照**，重算覆盖
+该快照的 `digest` 并返回；每个 revision 的快照逐版本保留，旧 revision 可随时审计
+比对。
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/certificates/reverify \
@@ -667,7 +670,7 @@ curl -X POST http://localhost:8000/api/v1/certificates/reverify \
 | `readings` | object | 新的孔位 → 数值读数；省略或 `null` 表示缺失；`NaN`/`Infinity` 不允许 |
 | `view[]` | array | 可选的盲化操作视图；携带时其摘要必须与证书冻结摘要一致 |
 
-### 复核通过（200,revision 原子递增）
+### 复核通过（200，追加 revision 快照）
 
 ```json
 {
@@ -675,12 +678,15 @@ curl -X POST http://localhost:8000/api/v1/certificates/reverify \
   "batch_id": "B2026-0042",
   "status": "ACTIVE",
   "revision": 2,
-  "digest": "237699a01001fa68...",
+  "digest": "9d1c0e4b7a2f...",
   "view_digest": "8c4f2ab19d..."
 }
 ```
 
-`digest`/`view_digest` 与建立时一致（冻结快照不随 revision 改变）。
+每个 revision 都有独立的不可变证据快照（计划参数不变，`scan`/`readings` 为本次
+提交）;`digest` 覆盖**本次 revision** 的快照，因此成功重核验后随新证据更新（相同
+证据内容得到相同 digest);`view_digest` 仍是建立时冻结的视图摘要。旧 revision 的
+快照与 digest 在证书库中逐版本保留，可独立审计。
 
 ### 复核失败（200,`status = "REVOKED"`，返回首个失效原因）
 
@@ -735,8 +741,9 @@ curl -X POST http://localhost:8000/api/v1/certificates/reverify \
 
 - 证书**只保存盲化操作视图的 SHA-256 摘要**，不保存视图本身；**绝不保存密钥
   份额或明文映射**（份额与 blind_id ↔ sample_id 对应关系从不进入证书存储）;
-- `digest` 覆盖冻结快照的全部内容（批次、板型、layout、scan、readings、样本
-  分组、seed、阈值与视图摘要），可用于独立审计比对；
+- `digest` 覆盖当前 revision 快照的全部内容（批次、板型、layout、scan、
+  readings、样本分组、seed、阈值与视图摘要）；每次成功重核验都在同一事务中追加
+  一个不可变 revision 快照（各自的 `digest` 覆盖各自内容），旧版本可独立审计比对;
 - 数据库路径由 `CERT_DB_PATH` 配置（默认 `./certificates.db`;Docker Compose
   将其设为 `/data/certificates.db` 并挂载命名卷持久化）。
 
@@ -1076,8 +1083,10 @@ curl -X POST http://localhost:8000/api/v1/blinding/unblind \
   网格点以"最接近理想抽取量、居中取较小值"唯一决胜,来源按 id 排序,
   相同输入必然得到逐字节相同的指令、实际浓度与来源余量。
 - 批次证书完全复用上述放行核验:相同（放行请求， 视图）必然得到相同的
-  冻结快照与内容 `digest`;证书状态（`revision`/`REVOKED`）由 SQLite
-  事务保证单调推进——revision 只增不减，吊销不可逆。
+  冻结快照与内容 `digest`;成功重核验在同一事务中追加新 revision 的不可变
+  证据快照并重算 `digest`，相同（新 scan/readings）必然得到相同的新
+  `digest`;证书状态（`revision`/`REVOKED`）由 SQLite 事务保证单调推进——
+  revision 只增不减，吊销不可逆。
 
 ## 配置（环境变量）
 
@@ -1110,7 +1119,7 @@ app/
   reconciler.py 扫描核对与最少步数纠位指令生成（空孔链 → 闭环暂存）
   spatial_qc.py 组中位数中心化 + 行列中位数剥离（median polish）与组内置换检验
   release.py   批次放行两级门控:扫描吻合核验（复用纠位规则）→ 空间质控放行门
-  certificates.py 批次证书:放行结果冻结快照（SQLite 单事务）、重核验原子递增/吊销、request_key 幂等
+  certificates.py 批次证书:放行结果冻结快照（SQLite 单事务）、按 revision 追加不可变证据快照的重核验（通过则重算 digest,失败则吊销）、request_key 幂等
   dilution.py  稀释梯度配制:共享库存核算 + 分辨率取整 + 容差校验,确定性逐步移液指令
   blinding.py  双人协作盲化/解盲:AES-256-GCM 认证加密映射包 + XOR 双份额
   metrics.py   指标独立重算与布局约束校验
