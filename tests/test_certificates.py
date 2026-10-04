@@ -3,21 +3,26 @@
 Creation reuses the release verification: only a RELEASED verdict is
 certified, freezing layout/scan/readings/thresholds and the blinded-view
 digest into one SQLite transaction. Re-verification restores the frozen
-parameters, increments the revision atomically on success and revokes the
-certificate on any misplacement, QC failure or view-digest change (first
-failure reason returned). A revoked certificate can never be restored and
-stale revisions can never overwrite. Idempotency: the same request_key with
-identical content replays the recorded response; different content is 409.
+parameters; success appends a new immutable evidence revision (the fresh
+scan/readings get their own digest) and failure revokes the certificate on
+any misplacement, QC failure or view-digest change (first failure reason
+returned) without producing a new revision. A revoked certificate can never
+be restored and stale revisions can never overwrite. Evidence revisions and
+idempotency records survive a process restart. Idempotency: the same
+request_key with identical content replays the recorded response; different
+content is 409.
 """
 import hashlib
 import json
 import sqlite3
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app import certificates
 from app.main import app
+from app.schemas import CertificateReverifyRequest
 
 client = TestClient(app)
 
@@ -49,12 +54,17 @@ def _hash(text: str) -> int:
     return int(hashlib.md5(text.encode()).hexdigest()[:6], 16)
 
 
-def _readings(row_bump=0.0):
+def _readings(row_bump=0.0, offset=0.0):
     out = {}
     for sid, well in LAYOUT_4X4.items():
         base = 100.0 if sid.startswith("gA") else 0.0
         noise = (_hash(sid) % 7) - 3  # -3..3
-        out[well] = base + (row_bump if well[0] == "A" else 0.0) + noise
+        out[well] = (
+            base
+            + (row_bump if well[0] == "A" else 0.0)
+            + noise
+            + offset
+        )
     return out
 
 
@@ -100,7 +110,9 @@ def _reverify_payload(**over):
         "request_key": "reverify-1",
         "expected_revision": 1,
         "scan": {w: s for s, w in LAYOUT_4X4.items()},
-        "readings": _readings(),
+        # Fresh readings that still pass every gate (a constant offset does
+        # not change spatial effects); distinct from the creation evidence.
+        "readings": _readings(offset=0.5),
         "view": _view(),
     }
     payload.update(over)
@@ -233,7 +245,7 @@ def test_create_not_certified_response_is_recorded_under_the_key():
 # ------------------------------------------------------------------- reverify
 
 
-def test_reverify_success_increments_revision_atomically():
+def test_reverify_success_appends_immutable_evidence_revision(fresh_store):
     created = _create_cert()
     r = client.post("/api/v1/certificates/reverify", json=_reverify_payload())
     assert r.status_code == 200, r.text
@@ -241,13 +253,44 @@ def test_reverify_success_increments_revision_atomically():
     assert body["status"] == "ACTIVE"
     assert body["revision"] == 2
     assert body["certificate_id"] == created["certificate_id"]
-    assert body["digest"] == created["digest"]
+    # The digest is recomputed over the new evidence snapshot — it covers the
+    # fresh readings and therefore differs from the creation digest.
+    assert body["digest"] != created["digest"]
     assert body["view_digest"] == created["view_digest"]
 
+    db = sqlite3.connect(str(fresh_store))
+    rev_rows = db.execute(
+        "SELECT revision, digest, snapshot FROM certificate_revisions "
+        "ORDER BY revision"
+    ).fetchall()
+    assert [row[0] for row in rev_rows] == [1, 2]
+    rev1, rev2 = rev_rows
+    # Each revision's digest equals SHA-256 over its own stored snapshot.
+    assert rev1[1] == created["digest"]
+    snap1, snap2 = json.loads(rev1[2]), json.loads(rev2[2])
+    assert snap1["readings"] == _readings()
+    assert snap2["readings"] == _readings(offset=0.5)
+    canonical = json.dumps(
+        snap2, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    assert hashlib.sha256(canonical).hexdigest() == body["digest"] == rev2[1]
+    # Revision 1 evidence is byte-identical to the creation snapshot, while
+    # the certificate row now points at the revision-2 evidence.
+    cert_row = db.execute(
+        "SELECT digest, snapshot, revision FROM certificates").fetchone()
+    assert cert_row[2] == 2 and cert_row[0] == body["digest"]
+    assert cert_row[1] == rev2[2]
+    assert rev1[2] != rev2[2]
+    db.close()
+
+    # A further successful re-verification appends revision 3 evidence.
     r = client.post("/api/v1/certificates/reverify", json=_reverify_payload(
-        request_key="reverify-2", expected_revision=2))
+        request_key="reverify-2", expected_revision=2,
+        readings=_readings(offset=1.5)))
     assert r.status_code == 200
-    assert r.json()["revision"] == 3
+    third = r.json()
+    assert third["revision"] == 3
+    assert third["digest"] not in {created["digest"], body["digest"]}
 
 
 def test_reverify_replay_does_not_double_increment():
@@ -291,6 +334,143 @@ def test_reverify_stale_revision_is_409_and_never_overwrites():
         request_key="reverify-3", expected_revision=2))
     assert r.status_code == 200
     assert r.json()["revision"] == 3
+
+
+def test_reverify_replay_returns_new_evidence_without_extra_revision(fresh_store):
+    created = _create_cert()
+    payload = _reverify_payload()
+    b1 = client.post("/api/v1/certificates/reverify", json=payload)
+    b2 = client.post("/api/v1/certificates/reverify", json=payload)
+    assert b1.status_code == 200 and b2.status_code == 200
+    assert b1.json() == b2.json()
+    assert b2.json()["revision"] == 2
+    assert b2.json()["digest"] != created["digest"]
+    db = sqlite3.connect(str(fresh_store))
+    # Replay must not append a second revision-2 row or any revision 3.
+    rows = db.execute(
+        "SELECT revision, COUNT(*) FROM certificate_revisions GROUP BY revision"
+    ).fetchall()
+    assert rows == [(1, 1), (2, 1)]
+    db.close()
+
+
+def test_evidence_revisions_and_replay_survive_restart(fresh_store):
+    created = _create_cert()
+    first = client.post(
+        "/api/v1/certificates/reverify", json=_reverify_payload()).json()
+    second = client.post("/api/v1/certificates/reverify", json=_reverify_payload(
+        request_key="reverify-2", expected_revision=2,
+        readings=_readings(offset=1.5))).json()
+    assert second["revision"] == 3
+
+    # Simulate a process restart: drop every cached connection and reopen.
+    certificates.reset_stores()
+    store = certificates.get_store()
+    try:
+        status, body = certificates.reverify_certificate(
+            CertificateReverifyRequest(**_reverify_payload()))
+        assert status == 200
+        # The idempotency record survived the restart: identical key+content
+        # replays revision 2 and never appends a new revision.
+        assert body == first
+        assert body["revision"] == 2 and body["digest"] == first["digest"]
+
+        with store.transaction() as conn:
+            cert = certificates._get_certificate(conn, "BATCH-1")
+            assert cert["status"] == "ACTIVE"
+            assert cert["revision"] == 3
+            # The current snapshot/digest are the revision-3 evidence...
+            assert cert["digest"] == second["digest"]
+            rows = conn.execute(
+                "SELECT revision, digest, snapshot FROM certificate_revisions "
+                "ORDER BY revision").fetchall()
+            assert [row["revision"] for row in rows] == [1, 2, 3]
+            # ...and every historical revision is still auditable verbatim.
+            assert rows[0]["digest"] == created["digest"]
+            assert rows[1]["digest"] == first["digest"]
+            assert rows[2]["digest"] == second["digest"]
+            assert json.loads(rows[0]["snapshot"])["readings"] == _readings()
+            assert json.loads(rows[1]["snapshot"])["readings"] == \
+                _readings(offset=0.5)
+            assert json.loads(rows[2]["snapshot"])["readings"] == \
+                _readings(offset=1.5)
+            for row in rows:
+                assert certificates._sha256(
+                    row["snapshot"].encode("utf-8")) == row["digest"]
+    finally:
+        certificates.reset_stores()
+
+
+def test_failed_reverify_appends_no_revision_and_keeps_old_evidence(fresh_store):
+    created = _create_cert()
+    payload = _reverify_payload(readings=_readings(row_bump=100.0))
+    r = client.post("/api/v1/certificates/reverify", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "REVOKED"
+    assert body["revision"] == 1
+    assert body["digest"] == created["digest"]
+    db = sqlite3.connect(str(fresh_store))
+    # No new evidence revision was produced; revision 1 is untouched.
+    rows = db.execute(
+        "SELECT revision, digest FROM certificate_revisions ORDER BY revision"
+    ).fetchall()
+    assert rows == [(1, created["digest"])]
+    cert_row = db.execute(
+        "SELECT status, revision, digest FROM certificates").fetchone()
+    assert cert_row == ("REVOKED", 1, created["digest"])
+    db.close()
+
+
+def test_concurrent_reverify_serialises_to_one_revision(fresh_store):
+    _create_cert()
+
+    def request(expected_revision, key):
+        return certificates.reverify_certificate(
+            CertificateReverifyRequest(**_reverify_payload(
+                request_key=key, expected_revision=expected_revision)))
+
+    # Two threads racing at revision 1: exactly one may append revision 2;
+    # the other loses the optimistic update guard as a stale revision.
+    outcomes = {}
+
+    def worker(name, key, barrier):
+        barrier.wait()
+        outcomes[name] = request(1, key)
+
+    barrier = threading.Barrier(2)
+    threads = [
+        threading.Thread(target=worker, args=("a", "rv-a", barrier)),
+        threading.Thread(target=worker, args=("b", "rv-b", barrier)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    statuses = sorted(status for status, _ in outcomes.values())
+    assert statuses == [200, 409]
+    winner = next(body for status, body in outcomes.values() if status == 200)
+    loser = next(body for status, body in outcomes.values() if status == 409)
+    assert winner["revision"] == 2
+    assert loser["error"] == "CERTIFICATE_REVISION_MISMATCH"
+    assert loser["current_revision"] == 2 and loser["expected_revision"] == 1
+
+    db = sqlite3.connect(str(fresh_store))
+    rows = db.execute(
+        "SELECT revision, COUNT(*) FROM certificate_revisions GROUP BY revision"
+    ).fetchall()
+    assert rows == [(1, 1), (2, 1)]
+    db.close()
+
+    # The stale loser's key was not recorded (state-dependent 409s never
+    # burn a key); retrying it against the new revision succeeds and appends
+    # revision 3. The winner's recorded key cannot carry new content.
+    winner_key = "rv-a" if outcomes["a"][0] == 200 else "rv-b"
+    loser_key = "rv-b" if winner_key == "rv-a" else "rv-a"
+    status, body = request(2, loser_key)
+    assert status == 200 and body["revision"] == 3
+    status, body = request(3, winner_key)
+    assert status == 409 and body["error"] == "REQUEST_KEY_CONFLICT"
 
 
 def test_reverify_unknown_batch_is_404():
@@ -426,7 +606,6 @@ def test_certificate_stores_no_view_entries_or_plaintext_blind_mapping(fresh_sto
     conn = sqlite3.connect(str(fresh_store))
     row = conn.execute(
         "SELECT snapshot, view_digest, digest FROM certificates").fetchone()
-    conn.close()
     snapshot, view_digest, digest = row
     stored = json.loads(snapshot)
     # The snapshot freezes layout/scan/readings/thresholds plus the view
@@ -438,6 +617,13 @@ def test_certificate_stores_no_view_entries_or_plaintext_blind_mapping(fresh_sto
         "blocked_wells", "seed", "thresholds", "view_digest",
     }
     assert len(view_digest) == 64 and len(digest) == 64
+    # The immutable revision history stores the same evidence shape and never
+    # any view entries either.
+    rev = conn.execute(
+        "SELECT snapshot, digest FROM certificate_revisions "
+        "WHERE batch_id = 'BATCH-1' AND revision = 1").fetchone()
+    assert rev[0] == snapshot and rev[1] == digest
+    conn.close()
     # No blind_id appears anywhere in the database files (main db or WAL).
     for suffix in ("", "-wal", "-shm"):
         path = fresh_store.with_name(fresh_store.name + suffix)

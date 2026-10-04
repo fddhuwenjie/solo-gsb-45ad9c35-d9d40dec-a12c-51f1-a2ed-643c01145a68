@@ -504,10 +504,13 @@ class CertificateReverifyRequest(BaseModel):
     frozen certificate snapshot; only ``scan``, ``readings`` and the optional
     blinded operational ``view`` are supplied anew. ``expected_revision``
     must equal the certificate's current revision (older revisions can never
-    be overwritten). If the batch still passes, the revision is incremented
-    atomically; any misplacement, QC failure or view-digest change marks the
-    certificate REVOKED and returns the first failure reason. A revoked
-    certificate can never be restored.
+    be overwritten). If the batch still passes, a new immutable evidence
+    revision is appended in the same transaction: revision N+1 freezes the
+    fresh scan/readings and gets a digest recomputed over that snapshot
+    (returned as ``digest``); the previous revisions stay auditable. Any
+    misplacement, QC failure or view-digest change marks the certificate
+    REVOKED and returns the first failure reason without producing a new
+    revision. A revoked certificate can never be restored.
     """
 
     model_config = ConfigDict(extra="forbid")
